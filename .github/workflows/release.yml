@@ -18,6 +18,7 @@ jobs:
         with:
           version: 0.15.2
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --lib
       - run: cargo build --release
       - run: |
           mkdir -p bin
@@ -110,10 +111,19 @@ jobs:
         with:
           files: godotty-*.zip
           body: |
-            A full-featured yet light-weight terminal emulator for the Godot
-            Engine, powered by libghostty.
+            Multiple terminals now remain visible in an automatic grid in the
+            bottom panel and main screen. Panes fill columns first and wrap to
+            new rows as the editor width changes.
+
+            - Click a pane or tab to focus it; drag tabs to reorder panes.
+            - Closing the last terminal restores the empty state.
+            - Includes source-install instructions and a copyable AI agent prompt.
+            - Validated in Godot 4.7.2 on macOS: two bottom-panel columns,
+              a 2x2 grid, focus changes, closing, and resizing.
 
             **Install:** download `godotty-${{ github.ref_name }}.zip` below and
             extract it into your project root.
 
-            See the [README](https://github.com/ingur/godotty#readme) for usage.
+            Requires Godot 4.7+. Restart the editor after replacing the addon.
+
+            See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for usage.

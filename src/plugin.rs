@@ -5,9 +5,9 @@ use godot::classes::object::ConnectFlags;
 use godot::classes::tab_bar::CloseButtonDisplayPolicy;
 use godot::classes::{
     Button, CenterContainer, Control, EditorExportPlugin, EditorInterface, EditorPlugin,
-    EditorSettings, HBoxContainer, IEditorExportPlugin, IEditorPlugin, IVBoxContainer, InputEvent,
-    InputEventKey, Label, MarginContainer, PanelContainer, Shortcut, TabBar, TabContainer,
-    Texture2D, VBoxContainer,
+    EditorSettings, GridContainer, HBoxContainer, IEditorExportPlugin, IEditorPlugin,
+    IVBoxContainer, InputEvent, InputEventKey, Label, PanelContainer, Shortcut, TabBar,
+    TabContainer, Texture2D, VBoxContainer,
 };
 use godot::global::{HorizontalAlignment, Key as GKey};
 use godot::prelude::*;
@@ -44,14 +44,22 @@ const DOCK_SLOT_DEFAULT: i32 = 0; // DockSlot::LEFT_UL
 const DOCK_SLOT_NAMES: &str = "Far Left Top,Far Left Bottom,Left Top (Scene),\
 Left Bottom (FileSystem),Right Top (Inspector),Right Bottom,Far Right Top,Far Right Bottom";
 
-/// Tabbed terminals for the bottom panel and the main screen: one row with
-/// the tab strip and a new-terminal button, terminals stacked below.
+/// Preferred pane width in editor units; narrower areas fall back to one column.
+const TERMINAL_COLUMN_WIDTH: f32 = 320.0;
+
+fn terminal_columns(count: i32, width: f32, scale: f32, gap: f32) -> i32 {
+    let available = ((width + gap) / (TERMINAL_COLUMN_WIDTH * scale + gap)).floor() as i32;
+    available.clamp(1, count.max(1))
+}
+
+/// Simultaneously visible terminals for the bottom panel and main screen.
+/// The tab strip selects focus and controls the order of panes in the grid.
 #[derive(GodotClass)]
 #[class(tool, init, base = VBoxContainer, internal)]
 pub struct TerminalTabs {
     base: Base<VBoxContainer>,
     bar: Option<Gd<TabBar>>,
-    stack: Option<Gd<MarginContainer>>,
+    grid: Option<Gd<GridContainer>>,
     empty: Option<Gd<CenterContainer>>,
 }
 
@@ -59,20 +67,32 @@ pub struct TerminalTabs {
 impl TerminalTabs {
     #[func]
     pub fn add_terminal(&mut self) {
-        if self.stack.is_none() || self.bar.is_none() {
+        if self.grid.is_none() || self.bar.is_none() {
             return;
         }
-        let terminal = new_wired_terminal(self.to_gd().upcast());
-        let (Some(stack), Some(bar)) = (self.stack.as_mut(), self.bar.as_mut()) else {
+        let mut terminal = new_wired_terminal(self.to_gd().upcast());
+        terminal.set_h_size_flags(SizeFlags::EXPAND_FILL);
+        terminal.set_v_size_flags(SizeFlags::EXPAND_FILL);
+        let on_focus = self
+            .to_gd()
+            .callable("on_terminal_focused")
+            .bindv(&varray![&terminal.to_variant()]);
+        terminal.connect_flags(
+            "focus_entered",
+            &on_focus,
+            ConnectFlags::DEFERRED,
+        );
+        let (Some(grid), Some(bar)) = (self.grid.as_mut(), self.bar.as_mut()) else {
             return;
         };
-        stack.add_child(&terminal);
+        grid.add_child(&terminal);
         bar.add_tab_ex().title(&default_title()).done();
         let last = bar.get_tab_count() - 1;
         // Tabs carry the terminal's identity so order can always be resynced.
         bar.set_tab_metadata(last, &terminal.instance_id().to_i64().to_variant());
         bar.set_current_tab(last);
-        self.show_only(last);
+        self.update_columns();
+        self.focus_active();
         self.update_empty();
     }
 
@@ -84,10 +104,10 @@ impl TerminalTabs {
             self.add_terminal();
             return;
         }
-        let Some(stack) = self.stack.as_ref() else {
+        let Some(grid) = self.grid.as_ref() else {
             return;
         };
-        if let Some(mut child) = stack.get_child(tab) {
+        if let Some(mut child) = grid.get_child(tab) {
             child.call_deferred("grab_focus", &[]);
         }
     }
@@ -105,7 +125,33 @@ impl TerminalTabs {
 
     #[func]
     fn on_tab_changed(&mut self, tab: i32) {
-        self.show_only(tab);
+        // Ignore stale deferred changes after adding, closing, or clicking panes.
+        if tab >= 0
+            && self
+                .bar
+                .as_ref()
+                .is_some_and(|bar| bar.get_current_tab() == tab)
+        {
+            self.focus_active();
+        }
+    }
+
+    #[func]
+    fn on_terminal_focused(&mut self, terminal: Variant) {
+        let Ok(terminal) = terminal.try_to::<Gd<Terminal>>() else {
+            return;
+        };
+        if !terminal.has_focus() {
+            return;
+        }
+        let tab = terminal.get_index();
+        let Some(bar) = self.bar.as_mut() else { return };
+        if tab >= 0 && tab < bar.get_tab_count() {
+            // Reflect mouse/keyboard focus without scheduling another focus grab.
+            bar.set_block_signals(true);
+            bar.set_current_tab(tab);
+            bar.set_block_signals(false);
+        }
     }
 
     #[func]
@@ -137,45 +183,45 @@ impl TerminalTabs {
         self.close_tab(terminal.get_index());
     }
 
-    /// TabBar reorders any dragged tab, active or not; rebuild the stack
+    /// TabBar reorders any dragged tab, active or not; rebuild the grid
     /// order from the identities the tabs carry.
     #[func]
     fn on_tab_rearranged(&mut self, _to: i32) {
-        let (Some(stack), Some(bar)) = (self.stack.as_mut(), self.bar.as_mut()) else {
+        let (Some(grid), Some(bar)) = (self.grid.as_mut(), self.bar.as_mut()) else {
             return;
         };
         for tab in 0..bar.get_tab_count() {
             let Ok(id) = bar.get_tab_metadata(tab).try_to::<i64>() else {
                 continue;
             };
-            for i in tab..stack.get_child_count() {
-                let Some(child) = stack.get_child(i) else {
+            for i in tab..grid.get_child_count() {
+                let Some(child) = grid.get_child(i) else {
                     continue;
                 };
                 if child.instance_id().to_i64() == id {
                     if i != tab {
-                        stack.move_child(&child, tab);
+                        grid.move_child(&child, tab);
                     }
                     break;
                 }
             }
         }
-        let current = self.bar.as_ref().map_or(-1, |bar| bar.get_current_tab());
-        self.show_only(current);
+        self.focus_active();
     }
 
     fn close_tab(&mut self, tab: i32) {
-        let (Some(stack), Some(bar)) = (self.stack.as_mut(), self.bar.as_mut()) else {
+        let (Some(grid), Some(bar)) = (self.grid.as_mut(), self.bar.as_mut()) else {
             return;
         };
         if tab < 0 || tab >= bar.get_tab_count() {
             return;
         }
-        if let Some(child) = stack.get_child(tab) {
-            stack.remove_child(&child);
+        if let Some(child) = grid.get_child(tab) {
+            grid.remove_child(&child);
             child.free();
         }
         bar.remove_tab(tab);
+        self.update_columns();
         self.update_empty();
     }
 
@@ -186,21 +232,16 @@ impl TerminalTabs {
         }
     }
 
-    fn show_only(&mut self, tab: i32) {
-        let Some(stack) = self.stack.as_mut() else {
+    #[func]
+    fn update_columns(&mut self) {
+        let Some(grid) = self.grid.as_mut() else {
             return;
         };
-        for i in 0..stack.get_child_count() {
-            let Some(child) = stack.get_child(i) else {
-                continue;
-            };
-            let Ok(mut control) = child.try_cast::<Control>() else {
-                continue;
-            };
-            control.set_visible(i == tab);
-            if i == tab {
-                control.call_deferred("grab_focus", &[]);
-            }
+        let scale = EditorInterface::singleton().get_editor_scale();
+        let gap = grid.get_theme_constant("h_separation") as f32;
+        let columns = terminal_columns(grid.get_child_count(), grid.get_size().x, scale, gap);
+        if grid.get_columns() != columns {
+            grid.set_columns(columns);
         }
     }
 }
@@ -213,13 +254,19 @@ impl IVBoxContainer for TerminalTabs {
         }
         let mut row = HBoxContainer::new_alloc();
         let mut bar = TabBar::new_alloc();
-        bar.set_clip_tabs(false);
+        bar.set_clip_tabs(true);
+        bar.set_h_size_flags(SizeFlags::EXPAND_FILL);
         bar.set_max_tab_width(200);
         bar.set_tab_close_display_policy(CloseButtonDisplayPolicy::SHOW_ALWAYS);
         bar.set_drag_to_rearrange_enabled(true);
         bar.set_theme_type_variation("TabContainer");
         bar.connect_flags(
             "tab_changed",
+            &self.to_gd().callable("on_tab_changed"),
+            ConnectFlags::DEFERRED,
+        );
+        bar.connect_flags(
+            "tab_clicked",
             &self.to_gd().callable("on_tab_changed"),
             ConnectFlags::DEFERRED,
         );
@@ -243,8 +290,16 @@ impl IVBoxContainer for TerminalTabs {
 
         let mut panel = PanelContainer::new_alloc();
         panel.set_v_size_flags(SizeFlags::EXPAND_FILL);
-        let stack = MarginContainer::new_alloc();
-        panel.add_child(&stack);
+        let mut grid = GridContainer::new_alloc();
+        let gap = (8.0 * EditorInterface::singleton().get_editor_scale()).round() as i32;
+        grid.add_theme_constant_override("h_separation", gap);
+        grid.add_theme_constant_override("v_separation", gap);
+        grid.connect_flags(
+            "resized",
+            &self.to_gd().callable("update_columns"),
+            ConnectFlags::DEFERRED,
+        );
+        panel.add_child(&grid);
         let mut empty = CenterContainer::new_alloc();
         let mut empty_box = VBoxContainer::new_alloc();
         let mut label = Label::new_alloc();
@@ -263,7 +318,7 @@ impl IVBoxContainer for TerminalTabs {
         panel.add_child(&empty);
         self.base_mut().add_child(&panel);
         self.bar = Some(bar);
-        self.stack = Some(stack);
+        self.grid = Some(grid);
         self.empty = Some(empty);
     }
 
@@ -285,7 +340,7 @@ impl IVBoxContainer for TerminalTabs {
 }
 
 /// Terminals in three editor locations: per-terminal docks (native drag,
-/// float, tabbing), a tabbed bottom panel, and a tabbed main screen.
+/// float, tabbing), a grid in the bottom panel, and a grid in the main screen.
 #[derive(GodotClass)]
 #[class(tool, init, base = EditorPlugin, internal)]
 struct TerminalPanel {
@@ -818,4 +873,26 @@ fn editor_icon(name: &str) -> Option<Gd<Texture2D>> {
         .get_theme_icon_ex(name)
         .theme_type("EditorIcons")
         .done()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_columns;
+
+    #[test]
+    fn columns_wrap_at_the_preferred_width_including_gaps() {
+        assert_eq!(terminal_columns(4, 647.0, 1.0, 8.0), 1);
+        assert_eq!(terminal_columns(4, 648.0, 1.0, 8.0), 2);
+        assert_eq!(terminal_columns(4, 975.0, 1.0, 8.0), 2);
+        assert_eq!(terminal_columns(4, 976.0, 1.0, 8.0), 3);
+    }
+
+    #[test]
+    fn columns_follow_terminal_count_and_editor_scale() {
+        assert_eq!(terminal_columns(4, 1296.0, 2.0, 16.0), 2);
+        assert_eq!(terminal_columns(2, 2000.0, 1.0, 8.0), 2);
+        assert_eq!(terminal_columns(1, 2000.0, 1.0, 8.0), 1);
+        assert_eq!(terminal_columns(0, 2000.0, 1.0, 8.0), 1);
+        assert_eq!(terminal_columns(4, 0.0, 1.0, 8.0), 1);
+    }
 }
